@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ASG resources for Blue/Green deployment'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name
+    
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: EC2 instance type
+    
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair
+    
+  LatestAmiId:
+    Type: String
+    Default: ami-0599b6e53ca798bb2
+    Description: Latest Amazon Linux 2023 AMI
+
+Resources:
+  # Launch Template for Blue Environment
+  BlueLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-BlueLaunchTemplate
+      VersionDescription: Initial version
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub ${EnvironmentName}-WebServerSG
+        IamInstanceProfile:
+          Arn:
+            Fn::ImportValue: !Sub ${EnvironmentName}-EC2InstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            yum update -y
+            yum install -y ruby wget httpd
+            systemctl start httpd
+            systemctl enable httpd
+            cd /home/ec2-user
+            wget https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            echo "<html><body><h1>This is BLUE environment</h1></body></html>" > /var/www/html/index.html
+            echo "Environment=BLUE" >> /etc/environment
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${AWS::StackName}-Blue-Instance
+              - Key: Environment
+                Value: Blue
+
+  # Launch Template for Green Environment
+  GreenLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${AWS::StackName}-GreenLaunchTemplate
+      VersionDescription: Initial version
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub ${EnvironmentName}-WebServerSG
+        IamInstanceProfile:
+          Arn:
+            Fn::ImportValue: !Sub ${EnvironmentName}-EC2InstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            yum update -y
+            yum install -y ruby wget httpd
+            systemctl start httpd
+            systemctl enable httpd
+            cd /home/ec2-user
+            wget https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            echo "<html><body><h1>This is GREEN environment</h1></body></html>" > /var/www/html/index.html
+            echo "Environment=GREEN" >> /etc/environment
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${AWS::StackName}-Green-Instance
+              - Key: Environment
+                Value: Green
+
+  # Blue Auto Scaling Group
+  BlueAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${AWS::StackName}-BlueASG
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BlueLaunchTemplate
+        Version: !GetAtt BlueLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet1
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet2
+      TargetGroupARNs:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-BlueTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Blue-Instance
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: Blue
+          PropagateAtLaunch: true
+
+  # Green Auto Scaling Group (initially with 0 instances)
+  GreenAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${AWS::StackName}-GreenASG
+      MinSize: 0
+      MaxSize: 3
+      DesiredCapacity: 0
+      LaunchTemplate:
+        LaunchTemplateId: !Ref GreenLaunchTemplate
+        Version: !GetAtt GreenLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet1
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PublicSubnet2
+      TargetGroupARNs:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-GreenTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Green-Instance
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: Green
+          PropagateAtLaunch: true
+
+Outputs:
+  BlueAutoScalingGroup:
+    Description: Blue Auto Scaling Group Name
+    Value: !Ref BlueAutoScalingGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-BlueASG
+
+  GreenAutoScalingGroup:
+    Description: Green Auto Scaling Group Name
+    Value: !Ref GreenAutoScalingGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-GreenASG
+
+  BlueLaunchTemplate:
+    Description: Blue Launch Template ID
+    Value: !Ref BlueLaunchTemplate
+    Export:
+      Name: !Sub ${EnvironmentName}-BlueLaunchTemplate
+
+  GreenLaunchTemplate:
+    Description: Green Launch Template ID
+    Value: !Ref GreenLaunchTemplate
+    Export:
+      Name: !Sub ${EnvironmentName}-GreenLaunchTemplate

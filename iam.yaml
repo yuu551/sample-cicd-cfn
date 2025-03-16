@@ -1,0 +1,173 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM resources for Blue/Green deployment'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name
+
+Resources:
+  # EC2 Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+
+  # EC2 Role
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: /
+
+  # CodeDeploy Role
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+      Path: /
+
+  # CodeDeployにAutoScaling権限を追加
+  CodeDeployAutoScalingPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeDeployAutoScalingPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - autoscaling:*
+              - ec2:*
+              - elasticloadbalancing:*
+            Resource: '*'
+      Roles:
+        - !Ref CodeDeployServiceRole
+
+  # EC2インスタンス起動とIAMロール受け渡しの権限を追加
+  CodeDeployEC2LaunchPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeDeployEC2LaunchPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DeployWithASGCreatedWithLT
+            Effect: Allow
+            Action:
+              - iam:PassRole
+              - ec2:CreateTags
+              - ec2:RunInstances
+            Resource: '*'
+      Roles:
+        - !Ref CodeDeployServiceRole
+
+  # CodePipeline Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      # マネージドポリシーを削除し、インラインポリシーに置き換え
+
+  # CodePipelineのインラインポリシー
+  CodePipelineServicePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodePipelineServicePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # CodeStar Connectionsの使用権限
+          - Effect: Allow
+            Action:
+              - codestar-connections:UseConnection
+            Resource: "*"
+          # S3バケットへのアクセス権限
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetBucketVersioning
+              - s3:PutObject
+            Resource: "*"
+          # CodeDeployへのデプロイ権限
+          - Effect: Allow
+            Action:
+              - codedeploy:CreateDeployment
+              - codedeploy:GetDeployment
+              - codedeploy:GetDeploymentConfig
+              - codedeploy:GetApplicationRevision
+              - codedeploy:RegisterApplicationRevision
+              - codedeploy:GetApplication
+            Resource: "*"
+          # CloudWatchへのログ記録権限
+          - Effect: Allow
+            Action:
+              - cloudwatch:*
+              - logs:*
+            Resource: "*"
+      Roles:
+        - !Ref CodePipelineServiceRole
+
+  # Additional policy for EC2 to allow CodeDeploy agent
+  CodeDeployEC2Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeDeployEC2Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:ListBucket
+            Resource: '*'
+      Roles:
+        - !Ref EC2Role
+
+Outputs:
+  EC2InstanceProfile:
+    Description: EC2 Instance Profile ARN
+    Value: !GetAtt EC2InstanceProfile.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-EC2InstanceProfile
+
+  CodeDeployServiceRole:
+    Description: CodeDeploy Service Role ARN
+    Value: !GetAtt CodeDeployServiceRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-CodeDeployServiceRole
+
+  CodePipelineServiceRole:
+    Description: CodePipeline Service Role ARN
+    Value: !GetAtt CodePipelineServiceRole.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-CodePipelineServiceRole

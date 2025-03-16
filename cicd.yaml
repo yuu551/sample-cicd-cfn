@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CI/CD resources for Blue/Green deployment'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    Description: Environment name
+    
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner
+    
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+    
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub repository branch
+    
+  ApplicationName:
+    Type: String
+    Default: MyApplication
+    Description: CodeDeploy Application Name
+
+Resources:
+  # S3 Bucket for Artifacts
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # CodeDeploy Application
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Ref ApplicationName
+      ComputePlatform: Server
+
+  # Lambda実行ロール
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSCodeDeployFullAccess
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - logs:*
+                Resource: '*'
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - iam:PassRole
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService:
+                      - codedeploy.amazonaws.com
+
+  # Lambda関数
+  DeploymentGroupLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import cfnresponse
+          from botocore.exceptions import ClientError
+          import re
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          client = boto3.client('codedeploy')
+
+          def lambda_handler(event, context):
+              print('REQUEST RECEIVED:\n' + json.dumps(event))
+              responseData = {}
+              
+              appName = event['ResourceProperties']['appName']
+              deploymentGroup = event['ResourceProperties']['deploymentGroup']
+              autoScalingGroups = event['ResourceProperties']['autoScalingGroups']
+              serviceRoleArn = event['ResourceProperties']['serviceRoleArn']
+              deploymentConfigName = event['ResourceProperties']['deploymentConfigName']
+              targetGroupName = event['ResourceProperties']['targetGroupName']
+              
+              # ARNからターゲットグループ名を抽出する処理を追加
+              target_group_name = targetGroupName
+              if targetGroupName.startswith('arn:'):
+                  match = re.search(r'targetgroup/([^/]+)', targetGroupName)
+                  if match:
+                      target_group_name = match.group(1)
+              
+              # リクエストタイプを確認
+              if event['RequestType'] == 'Delete':
+                  try:
+                      # デプロイメントグループの削除
+                      client.delete_deployment_group(
+                          applicationName=appName,
+                          deploymentGroupName=deploymentGroup
+                      )
+                      logger.info("SUCCESS: Deployment Group deleted.")
+                      return cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                  except Exception as e:
+                      logger.error("ERROR: Failed to delete deployment group: %s", str(e))
+                      responseData = {'error': str(e)}
+                      return cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+              
+              # Create または Update の場合
+              try:
+                  # 既存のデプロイメントグループを確認
+                  try:
+                      client.get_deployment_group(
+                          applicationName=appName,
+                          deploymentGroupName=deploymentGroup
+                      )
+                      # 既存のデプロイメントグループを削除
+                      client.delete_deployment_group(
+                          applicationName=appName,
+                          deploymentGroupName=deploymentGroup
+                      )
+                      logger.info("SUCCESS: Existing Deployment Group deleted.")
+                  except ClientError:
+                      logger.info("Deployment Group does not exist. Creating new one.")
+                  
+                  # デプロイメントグループの作成
+                  res = client.create_deployment_group(
+                      applicationName=appName,
+                      deploymentGroupName=deploymentGroup,
+                      autoScalingGroups=[
+                          autoScalingGroups,
+                      ],
+                      deploymentConfigName=deploymentConfigName,
+                      serviceRoleArn=serviceRoleArn,
+                      autoRollbackConfiguration={
+                          'enabled': True,
+                          'events': [
+                              'DEPLOYMENT_FAILURE',
+                          ]
+                      },
+                      deploymentStyle={
+                          'deploymentType': 'BLUE_GREEN',
+                          'deploymentOption': 'WITH_TRAFFIC_CONTROL'
+                      },
+                      blueGreenDeploymentConfiguration={
+                          'terminateBlueInstancesOnDeploymentSuccess': {
+                              'action': 'TERMINATE',
+                              'terminationWaitTimeInMinutes': 0
+                          },
+                          'deploymentReadyOption': {
+                              'actionOnTimeout': 'CONTINUE_DEPLOYMENT'
+                          },
+                          'greenFleetProvisioningOption': {
+                              'action': 'COPY_AUTO_SCALING_GROUP'
+                          }
+                      },
+                      loadBalancerInfo={
+                          'targetGroupInfoList': [
+                              {
+                                  'name': target_group_name
+                              },
+                          ]
+                      },
+                  )
+                  
+                  logger.info("SUCCESS: Deployment Group created: %s", json.dumps(res))
+                  responseData = {'DeploymentGroupName': deploymentGroup}
+                  return cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              
+              except Exception as e:
+                  logger.error("ERROR: Failed to create deployment group: %s", str(e))
+                  responseData = {'error': str(e)}
+                  return cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.10
+      Timeout: 60
+
+  # カスタムリソースでデプロイメントグループを作成
+  BlueGreenDeploymentGroup:
+    Type: Custom::DeploymentGroup
+    Properties:
+      ServiceToken: !GetAtt DeploymentGroupLambda.Arn
+      appName: !Ref CodeDeployApplication
+      deploymentGroup: !Sub ${ApplicationName}-BlueGreen-DG
+      autoScalingGroups: 
+        Fn::ImportValue: !Sub ${EnvironmentName}-BlueASG
+      serviceRoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-CodeDeployServiceRole
+      deploymentConfigName: CodeDeployDefault.OneAtATime
+      targetGroupName:
+        Fn::ImportValue: !Sub ${EnvironmentName}-BlueTargetGroup
+  
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Sub "${ApplicationName}-${EnvironmentName}-github"
+      ProviderType: GitHub
+      Tags:
+      - Key: Name
+        Value: !Sub "${ApplicationName}-${EnvironmentName}-github"
+      - Key: Environment
+        Value: !Ref EnvironmentName
+
+  # CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn:
+        Fn::ImportValue: !Sub ${EnvironmentName}-CodePipelineServiceRole
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Sub ${GitHubOwner}/${GitHubRepo}
+                BranchName: !Ref GitHubBranch
+              OutputArtifacts:
+                - Name: SourceCode
+                
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref ApplicationName
+                DeploymentGroupName: !Sub ${ApplicationName}-BlueGreen-DG
+              InputArtifacts:
+                - Name: SourceCode
+
+Outputs:
+  PipelineURL:
+    Description: URL to the CodePipeline console
+    Value: !Sub https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${Pipeline}
+    
+  CodeDeployApplicationURL:
+    Description: URL to the CodeDeploy Application
+    Value: !Sub https://console.aws.amazon.com/codedeploy/home?region=${AWS::Region}#/applications/${CodeDeployApplication}
+    
+  ArtifactBucket:
+    Description: S3 Bucket for Pipeline Artifacts
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-ArtifactBucket
+      
+  DeploymentGroupName:
+    Description: CodeDeploy Deployment Group Name
+    Value: !GetAtt BlueGreenDeploymentGroup.DeploymentGroupName
