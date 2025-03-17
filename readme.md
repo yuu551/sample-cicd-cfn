@@ -77,7 +77,14 @@ cicd-cfn/
 - CodeBuildプロジェクト
 - CodeDeployアプリケーション
 - Lambda関数を使用したカスタムリソースによるCodeDeployデプロイメントグループ
-- CodePipeラインの設定
+- CodePipelineの設定
+
+**パラメータ**:
+- `EnvironmentName`: 環境名（デフォルト: dev）
+- `GitHubOwner`: GitHubリポジトリのオーナー
+- `GitHubRepo`: GitHubリポジトリ名
+- `GitHubBranch`: デプロイ対象のブランチ名（デフォルト: main）
+- `ApplicationName`: CodeDeployアプリケーション名（デフォルト: MyApplication）
 
 **特記事項**:
 - **カスタムリソースによるCodeDeployデプロイメントグループの作成**: 
